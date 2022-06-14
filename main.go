@@ -6,16 +6,30 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
+type GitLabInfo struct {
+	group    string
+	project  string
+	mrNumber string
+}
+
+type payload struct {
+	text string `json:"text"`
+}
+
+type data struct {
+	payload payload `json:"payload"`
+}
+
 func main() {
 	authToken := os.Getenv("SLACK_AUTH_TOKEN")
 	appToken := os.Getenv("SLACK_APP_TOKEN")
-	// channelID := os.Getenv("SLACK_CHANNEL_ID")
 
 	// slack client
 	client := slack.New(authToken, slack.OptionDebug(true), slack.OptionAppLevelToken(appToken))
@@ -70,18 +84,54 @@ func handleEventMessage(event slackevents.EventsAPIEvent, client *slack.Client) 
 	case slackevents.CallbackEvent:
 
 		innerEvent := event.InnerEvent
-		fmt.Println(innerEvent.Data)
+		fmt.Println(innerEvent.Type)
 		// Yet Another Type switch on the actual Data to see if its an AppMentionEvent
-		// switch ev := innerEvent.Data.(type) {
-		// case *slackevents.AppMentionEvent:
-		// 	// The application has been mentioned since this Event is a Mention event
-		// 	err := handleAppMentionEvent(ev, client)
-		// 	if err != nil {
-		// 		return err
-		// 	}
-		// }
+		switch ev := innerEvent.Data.(type) {
+		case *slackevents.MessageEvent:
+			if containsGitlabMR(ev.Text) {
+				gitLabMRs := pluckUrls(ev.Text)
+				for _, mr := range gitLabMRs {
+					fmt.Println("=======")
+					fmt.Printf("%+v\n", mr)
+					fmt.Println("=======")
+				}
+			}
+		}
 	default:
 		return errors.New("unsupported event type")
 	}
 	return nil
+}
+
+func containsGitlabMR(text string) bool {
+	return strings.Contains(text, "gitlab") && strings.Contains(text, "-/merge_requests/")
+}
+
+func pluckUrls(text string) []*GitLabInfo {
+	var urls []string
+	var gitLabInfos []*GitLabInfo
+	textAry := strings.Split(text, "<")
+	for _, v := range textAry {
+		if containsGitlabMR(v) {
+			ary := strings.Split(v, ">")
+			urls = append(urls, ary[0])
+		}
+	}
+	for _, url := range urls {
+		gitLabInfos = append(gitLabInfos, processUrl(url))
+	}
+	return gitLabInfos
+}
+
+func processUrl(url string) *GitLabInfo {
+	ary := strings.Split(url, "/")
+	group := ary[len(ary)-5]
+	project := ary[len(ary)-4]
+	mrNumber := ary[len(ary)-1]
+
+	return &GitLabInfo{
+		group,
+		project,
+		mrNumber,
+	}
 }
