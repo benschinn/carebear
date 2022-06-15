@@ -6,25 +6,24 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
+	"github.com/xanzy/go-gitlab"
 )
 
-type GitLabInfo struct {
-	group    string
-	project  string
-	mrNumber string
+type GitLabMR struct {
+	namespace string
+	project   string
+	number    int
 }
 
-type payload struct {
-	text string `json:"text"`
-}
-
-type data struct {
-	payload payload `json:"payload"`
+type apis struct {
+	slackClient  *slack.Client
+	gitlabClient *gitlab.Client
 }
 
 func main() {
@@ -32,19 +31,28 @@ func main() {
 	appToken := os.Getenv("SLACK_APP_TOKEN")
 
 	// slack client
-	client := slack.New(authToken, slack.OptionDebug(true), slack.OptionAppLevelToken(appToken))
+	slackClient := slack.New(authToken, slack.OptionDebug(true), slack.OptionAppLevelToken(appToken))
 	socketClient := socketmode.New(
-		client,
+		slackClient,
 		socketmode.OptionDebug(true),
 		// Option to set a custom logger
 		socketmode.OptionLog(log.New(os.Stdout, "socketmode: ", log.Lshortfile|log.LstdFlags)),
 	)
 
+	// gitlab client
+	gitlabToken := os.Getenv("GITLAB_ACCESS_TOKEN")
+	customGitlabUrl := fmt.Sprintf("%s/api/v4", os.Getenv("CUSTOM_GITLAB_URL"))
+	gitlabClient, err := gitlab.NewClient(gitlabToken, gitlab.WithBaseURL(customGitlabUrl))
+	if err != nil {
+		log.Fatalf("Failed to create client: %v", err)
+	}
+	a := &apis{slackClient, gitlabClient}
+
 	// Create a context that can be used to cancel goroutine
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func(ctx context.Context, client *slack.Client, socketClient *socketmode.Client) {
+	go func(ctx context.Context, socketClient *socketmode.Client) {
 		// Create a for loop that selects either the context cancellation or the events incomming
 		for {
 			select {
@@ -68,31 +76,47 @@ func main() {
 					socketClient.Ack(*event.Request)
 					// Now we have an Events API event, but this event type can in turn be many types, so we actually need another type switch
 					// log.Println(eventsAPIEvent)
-					handleEventMessage(eventsAPIEvent, client)
+					err := a.handleEventMessage(eventsAPIEvent)
+					if err != nil {
+						log.Fatalf("Failed to handle message event: %v", err)
+					}
 				}
 
 			}
 		}
-	}(ctx, client, socketClient)
+	}(ctx, socketClient)
 
 	socketClient.Run()
 }
 
-func handleEventMessage(event slackevents.EventsAPIEvent, client *slack.Client) error {
+func (a *apis) handleEventMessage(event slackevents.EventsAPIEvent) error {
 	switch event.Type {
 	// First we check if this is an CallbackEvent
 	case slackevents.CallbackEvent:
 
 		innerEvent := event.InnerEvent
-		fmt.Println(innerEvent.Type)
 		// Yet Another Type switch on the actual Data to see if its an AppMentionEvent
 		switch ev := innerEvent.Data.(type) {
 		case *slackevents.MessageEvent:
 			if containsGitlabMR(ev.Text) {
-				gitLabMRs := pluckUrls(ev.Text)
+				gitLabMRs, err := pluckUrls(ev.Text)
+				if err != nil {
+					return err
+				}
 				for _, mr := range gitLabMRs {
 					fmt.Println("=======")
-					fmt.Printf("%+v\n", mr)
+					// interact with GitLab API
+					// add Reaction
+					a.addReaction(ev.Channel, ev.TimeStamp)
+					// fmt.Printf("%+v\n", mr)
+					url := fmt.Sprintf("%s/%s", mr.namespace, mr.project)
+					getOpts := gitlab.GetMergeRequestsOptions{}
+					// get MR
+					mergeRequest, _, mrErr := a.gitlabClient.MergeRequests.GetMergeRequest(url, mr.number, &getOpts)
+					if mrErr != nil {
+						return mrErr
+					}
+					fmt.Printf("%+v\n", mergeRequest)
 					fmt.Println("=======")
 				}
 			}
@@ -103,13 +127,22 @@ func handleEventMessage(event slackevents.EventsAPIEvent, client *slack.Client) 
 	return nil
 }
 
+func (a *apis) addReaction(channelID, timestamp string) error {
+	msgRef := slack.NewRefToMessage(channelID, timestamp)
+	err := a.slackClient.AddReaction("one", msgRef)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func containsGitlabMR(text string) bool {
 	return strings.Contains(text, "gitlab") && strings.Contains(text, "-/merge_requests/")
 }
 
-func pluckUrls(text string) []*GitLabInfo {
+func pluckUrls(text string) ([]*GitLabMR, error) {
 	var urls []string
-	var gitLabInfos []*GitLabInfo
+	var mrs []*GitLabMR
 	textAry := strings.Split(text, "<")
 	for _, v := range textAry {
 		if containsGitlabMR(v) {
@@ -118,20 +151,28 @@ func pluckUrls(text string) []*GitLabInfo {
 		}
 	}
 	for _, url := range urls {
-		gitLabInfos = append(gitLabInfos, processUrl(url))
+		mr, err := processUrl(url)
+		if err != nil {
+			return nil, err
+		}
+		mrs = append(mrs, mr)
 	}
-	return gitLabInfos
+	return mrs, nil
 }
 
-func processUrl(url string) *GitLabInfo {
+func processUrl(url string) (*GitLabMR, error) {
 	ary := strings.Split(url, "/")
-	group := ary[len(ary)-5]
+	namespace := ary[len(ary)-5]
 	project := ary[len(ary)-4]
 	mrNumber := ary[len(ary)-1]
-
-	return &GitLabInfo{
-		group,
-		project,
-		mrNumber,
+	number, err := strconv.Atoi(mrNumber)
+	if err != nil {
+		return nil, err
 	}
+
+	return &GitLabMR{
+		namespace,
+		project,
+		number,
+	}, nil
 }
